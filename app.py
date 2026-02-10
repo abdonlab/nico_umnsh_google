@@ -15,10 +15,148 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 from dotenv import load_dotenv
 
+# ============================================================
+# RAG simple sobre PDFs locales (carpeta ./rag_docs)
+# ============================================================
+from typing import List
+from pypdf import PdfReader
+import numpy as np
+
+try:
+    from sentence_transformers import SentenceTransformer
+    import faiss
+except ImportError:
+    SentenceTransformer = None
+    faiss = None
+
+RAG_FOLDER = "rag_docs"
+RAG_INDEX_PATH = "rag_index.faiss"
+RAG_METADATA_PATH = "rag_metadata.json"
+
+_rag_model = None
+_rag_index = None
+_rag_texts: List[str] = []
+
+
+def rag_load_model():
+    global _rag_model
+    if _rag_model is None and SentenceTransformer is not None:
+        _rag_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _rag_model
+
+
+def rag_read_pdfs(folder: str) -> List[str]:
+    texts = []
+    if not os.path.isdir(folder):
+        return texts
+    for fname in os.listdir(folder):
+        if not fname.lower().endswith(".pdf"):
+            continue
+        fpath = os.path.join(folder, fname)
+        try:
+            reader = PdfReader(fpath)
+            pages_text = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    pages_text.append(t)
+            if pages_text:
+                doc_text = "\n".join(pages_text)
+                texts.append(doc_text)
+        except Exception as e:
+            print(f"RAG: error leyendo {fpath}: {e}")
+    return texts
+
+
+def rag_build_index():
+    global _rag_index, _rag_texts
+    if faiss is None:
+        print("RAG: faiss no disponible, índice no creado.")
+        return
+
+    model = rag_load_model()
+    if model is None:
+        print("RAG: modelo de embeddings no disponible.")
+        return
+
+    texts = rag_read_pdfs(RAG_FOLDER)
+    if not texts:
+        print("RAG: no se encontraron PDFs en la carpeta rag_docs.")
+        return
+
+    embeddings = model.encode(texts, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype("float32")
+
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+
+    _rag_index = index
+    _rag_texts = texts
+
+    try:
+        faiss.write_index(index, RAG_INDEX_PATH)
+        with open(RAG_METADATA_PATH, "w", encoding="utf-8") as f:
+            json.dump({"texts": texts}, f)
+    except Exception as e:
+        print(f"RAG: error guardando índice: {e}")
+
+
+def rag_load_index():
+    global _rag_index, _rag_texts
+    if _rag_index is not None:
+        return
+
+    if faiss is None:
+        print("RAG: faiss no disponible, no se puede cargar índice.")
+        return
+
+    if os.path.exists(RAG_INDEX_PATH) and os.path.exists(RAG_METADATA_PATH):
+        try:
+            _rag_index = faiss.read_index(RAG_INDEX_PATH)
+            with open(RAG_METADATA_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _rag_texts = data.get("texts", [])
+            return
+        except Exception as e:
+            print(f"RAG: error cargando índice, se reconstruirá: {e}")
+
+    rag_build_index()
+
+
+def rag_retrieve_context(query: str, top_k: int = 3) -> str:
+    rag_load_index()
+    if _rag_index is None or not _rag_texts:
+        return ""
+
+    model = rag_load_model()
+    if model is None:
+        return ""
+
+    q_emb = model.encode([query])
+    q_emb = np.array(q_emb).astype("float32")
+
+    k = min(top_k, len(_rag_texts))
+    distances, indices = _rag_index.search(q_emb, k)
+    indices = indices[0]
+
+    chunks = []
+    for idx in indices:
+        if 0 <= idx < len(_rag_texts):
+            chunks.append(_rag_texts[idx])
+
+    if not chunks:
+        return ""
+
+    context = "\n\n".join(chunks)
+    max_chars = 4000
+    if len(context) > max_chars:
+        context = context[:max_chars]
+    return context
+
 # ------------------------------------------------------------
 # Configuración inicial de Streamlit
 # ------------------------------------------------------------
-# 🎯 CORRECCIÓN DE SINTAXIS (Se eliminan caracteres invisibles U+00A0)
 st.set_page_config(
     page_title="NICO | Asistente Virtual UMSNH",
     page_icon="🦊",
@@ -32,7 +170,6 @@ _request_uri = os.environ.get("STREAMLIT_SERVER_REQUEST_URI", "")
 if "/oauth2callback" in _request_uri:
     parsed = urllib.parse.urlparse(_request_uri)
     query = urllib.parse.parse_qs(parsed.query)
-    # Convertir valores de lista a string para el nuevo query_params
     query_clean = {k: v[0] for k, v in query.items()}
     st.query_params.update(query_clean)
     st.rerun()
@@ -90,7 +227,6 @@ def get_flow(state=None):
 
 
 def ensure_session_defaults():
-    """Valores por defecto en session_state."""
     st.session_state.setdefault("logged", False)
     st.session_state.setdefault("profile", {})
     st.session_state.setdefault("history", [])
@@ -101,15 +237,12 @@ def ensure_session_defaults():
     st.session_state.setdefault("current_video", None)
     st.session_state.setdefault("open_cfg", False)
     st.session_state.setdefault("greeted", False)
-    # Nuevos para el control de input
     st.session_state.setdefault("input_val", "")
     st.session_state.setdefault("trigger_run", False)
-    # 🌟 CORRECCIÓN AUTH: Bandera para evitar doble intercambio de token (invalid_grant)
     st.session_state.setdefault("is_exchanging_token", False)
 
 
 def header_html():
-    """Cabecera visual."""
     video_path = "assets/videos/nico_header_video.mp4"
     video_tag = '<div class="nico-placeholder">🦊</div>'
     
@@ -158,9 +291,8 @@ def header_html():
 
 
 def login_view():
-    """Pantalla de login con botón de Google."""
     st.markdown(header_html(), unsafe_allow_html=True)
-    st.info("Inicia sesión con tu cuenta de Google para usar **NICO**.")
+    st.info("Inicia sesión con tu cuenta de Google para usar NICO.")
 
     if not CLIENT_ID or not CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
         st.error("Faltan variables de configuración OAuth.")
@@ -179,15 +311,12 @@ def login_view():
         state=state_key,
     )
 
-    # st.query_params para versiones nuevas
     st.query_params["oauth_state"] = state_key
     st.markdown(f"[🔐 Iniciar sesión con Google]({auth_url})")
 
 
 def exchange_code_for_token():
-    """Intercambiar el código OAuth por tokens y obtener perfil."""
     try:
-        # En nuevas versiones es un objeto tipo dict, no devuelve listas por defecto
         params = st.query_params
         code = params.get("code")
         state = params.get("state")
@@ -197,11 +326,9 @@ def exchange_code_for_token():
     if not code or not state:
         return
 
-    # 🌟 CORRECCIÓN AUTH: Bloquear la doble ejecución (Previene invalid_grant)
     if st.session_state.get("is_exchanging_token"):
         return
 
-    # Establecer la bandera antes de intentar el intercambio
     st.session_state["is_exchanging_token"] = True
 
     try:
@@ -226,30 +353,26 @@ def exchange_code_for_token():
             "picture": idinfo.get("picture"),
         }
         
-        # Limpiar la bandera en caso de éxito
         st.session_state["is_exchanging_token"] = False
-        st.query_params.clear() # Limpiar URL
+        st.query_params.clear()
         st.rerun() 
 
     except Exception as e:
         st.error(f"Error al autenticar: {e}")
-        # Limpiar la bandera y la URL en caso de fallo
         st.session_state["is_exchanging_token"] = False
         st.query_params.clear()
         st.rerun()
 
 
 # ============================================================
-# Gemini 2.0 con búsqueda en internet (REVERTIDO A PROMPT ÚNICO)
+# Gemini 2.0 con búsqueda en internet (prompt único)
 # ============================================================
-# 🌟 CORRECCIÓN GEMINI: Revertido a formato de prompt de texto único para evitar el error 400.
 def gemini_generate(prompt: str, temperature: float, top_p: float, max_tokens: int) -> str:
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
     }
-    # Payload simple: Envía todo el historial y las instrucciones como texto en 'contents'
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -274,10 +397,8 @@ def gemini_generate(prompt: str, temperature: float, top_p: float, max_tokens: i
 
 
 def speak_browser(text: str):
-    """
-    Usa la Web Speech API y sincroniza el video.
-    """
-    if not text: return
+    if not text:
+        return
     payload = json.dumps(text)
 
     js_code = f"""
@@ -350,16 +471,13 @@ if not st.session_state.get("logged"):
     login_view()
     st.stop()
 
-# Cabecera
 st.markdown(header_html(), unsafe_allow_html=True)
 
-# Layout: chat + video
 conv_col, video_col = st.columns([0.7, 0.3])
 
 with video_col:
     video_container = st.empty()
     
-    # Mostrar video actual o generar uno inicial
     if not st.session_state["current_video"]:
         try:
             video_files = [f for f in os.listdir("assets/videos") if f.lower().endswith((".mp4", ".webm"))]
@@ -374,13 +492,13 @@ with video_col:
                     <source src="data:video/mp4;base64,{b64}" type="video/mp4">
                 </video>
                 """
-        except: pass
+        except:
+            pass
             
     if st.session_state["current_video"]:
         video_container.markdown(st.session_state["current_video"], unsafe_allow_html=True)
 
 with conv_col:
-    # Barra superior de controles
     c1, c2, c3 = st.columns([0.15, 0.15, 0.7])
     with c1:
         if st.button("🎙️ Voz: " + ("ON" if st.session_state["voice_on"] else "OFF")):
@@ -403,40 +521,31 @@ with conv_col:
 
     st.markdown("### 💬 Conversación")
 
-    # --- LÓGICA DE INPUT (Callbacks para Enter y Borrar) ---
-    
     def action_submit():
-        """Activa la bandera para enviar a Gemini"""
         if st.session_state["input_val"].strip():
             st.session_state["trigger_run"] = True
 
     def action_clear():
-        """Limpia el texto sin enviar"""
         st.session_state["input_val"] = ""
         st.session_state["trigger_run"] = False
 
-    # Input con on_change (detecta Enter)
     st.text_input(
         "Escribe tu pregunta:", 
         key="input_val", 
         on_change=action_submit
     )
 
-    # Botones lado a lado
     btn_c1, btn_c2, _ = st.columns([0.15, 0.15, 0.7])
     with btn_c1:
         st.button("Enviar 🚀", on_click=action_submit)
     with btn_c2:
         st.button("Borrar 🗑️", on_click=action_clear)
 
-    # Procesamiento si se activó la bandera
     if st.session_state["trigger_run"]:
         user_msg = st.session_state["input_val"]
         
-        # 1. Guardar mensaje de usuario
         st.session_state["history"].append({"role": "user", "content": user_msg})
 
-        # 2. Video Aleatorio
         try:
             video_files = [f for f in os.listdir("assets/videos") if f.lower().endswith((".mp4", ".webm"))]
             if video_files:
@@ -455,25 +564,23 @@ with conv_col:
         except Exception as e:
             st.warning(f"Video error: {e}")
 
-        # 3. Obtener Nombre (Primer nombre)
         full_name = st.session_state['profile'].get('name', 'Usuario')
         first_name = full_name.split(' ')[0] if full_name else 'Amigo'
 
-        # 4. Prompt del Sistema (CONSTANTE)
         sys_prompt = (
             "Eres NICO, asistente institucional de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH). "
             f"El usuario se llama {first_name}. "
-            "se responsable e incluyente, eficiente y ético"    
+            "se responsable e incluyente, eficiente y ético"
             "Tu personalidad es alegre y jovial"
-            "Eres la mascota de la UMSNH eres un zorro, puedes hablar en español o purepecha"       
+            "Eres la mascota de la UMSNH eres un zorro, puedes hablar en español o purepecha"
             "NO uses negritas, NO uses Markdown, NO uses símbolos como **, *, _, #, ~~, etc.  "
             "NO generes listas con guiones viñetas asteriscos o puntos. "
             "Tu objetivo principal es proporcionar información precisa, actualizada y relevante de la UMSNH. "
-            "ANTE CUALQUIER PREGUNTA SOBRE NOTICIAS, CONTACTOS, O ACTUALIDAD (DESPUÉS DE 2023), DEBES EJECUTAR LA HERRAMIENTA DE BÚSQUEDA WEB DE GOOGLE (GoGoGoogleSearchh)"                                                                                                       
+            "ANTE CUALQUIER PREGUNTA SOBRE NOTICIAS, CONTACTOS, O ACTUALIDAD (DESPUÉS DE 2023), DEBES EJECUTAR LA HERRAMIENTA DE BÚSQUEDA WEB DE GOOGLE (GoGoGoogleSearchh)"
             "Responde siempre en español de mexico o en purépecha si es solicitado de forma clara, breve y amable. "
             "**IMPORTANTE: NO saludes al inicio de tu respuesta (ej. no digas 'Hola', 'Buenos días', 'Qué tal {nombre}'). El sistema ya saluda por ti la primera vez. Comienza directamente con la información solicitada o la respuesta a la pregunta.**"
             "Usa su nombre ocasionalmente en la conversación para que suene natural, pero no en cada frase.\n "
-            "para nombres de funcionarios busca la web en https://umich.mx/unidades-administrativas/"       
+            "para nombres de funcionarios busca la web en https://umich.mx/unidades-administrativas/"
             "Prioriza sitios *.umich.mx."
             "- https://www.umich.mx\n"
             "-https://www.gacetanicolaita.umich.mx/n"
@@ -483,30 +590,38 @@ with conv_col:
             "Solo si te preguntan quien es la rectora, responde con, La rectora de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) es Yarabí Ávila González. Fue designada para este cargo por el periodo 2023-2027."
             "Solo si te preguntan quien es el director de El director de la Dirección de Tecnologías de la Información y la Comunicación (DTIC) respondeEl director de la Dirección de Tecnologías de la Información y la Comunicación (DTIC) de la UMSNH (Universidad Michoacana de San Nicolás de Hidalgo) es el Ingeniero Francisco Octavio Aparicio Contreras"
             "El lema de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) es, Cuna de héroes, crisol de pensadores"
-             "cual es el himno de la UMSNH, Universidad Michoacana, Tienes el tesoro del saber, Universidad Michoacana,En tu esencia Humanista he de crecer. Universidad Michoacana, Llevas puesto el corazón de Ocampo, Universidad Michoacana, Tienes en tu sangre inscrito a Hidalgo." 
-             "Pis pas, calis calas es parte de una famosa porra de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) en Morelia, México, un grito tradicional de identidad y orgullo estudiantil que se canta en eventos deportivos y cívicos, significando rapidez y unidad, y a menudo se completa con ¡Pummm! ¡San Nicolás! "           
-             "Solo si te preguntan quien es el secretario general de la UMSNH El secretario general de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) es Javier Cervantes Rodríguez. Asumió el cargo en julio de 2023")
-        # 5. CONSTRUIR EL PROMPT COMPLETO CON HISTORIAL (para el error 400)
+            "cual es el himno de la UMSNH, Universidad Michoacana, Tienes el tesoro del saber, Universidad Michoacana,En tu esencia Humanista he de crecer. Universidad Michoacana, Llevas puesto el corazón de Ocampo, Universidad Michoacana, Tienes en tu sangre inscrito a Hidalgo."
+            "Pis pas, calis calas es parte de una famosa porra de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) en Morelia, México, un grito tradicional de identidad y orgullo estudiantil que se canta en eventos deportivos y cívicos, significando rapidez y unidad, y a menudo se completa con ¡Pummm! ¡San Nicolás! "
+            "Solo si te preguntan quien es el secretario general de la UMSNH El secretario general de la Universidad Michoacana de San Nicolás de Hidalgo (UMSNH) es Javier Cervantes Rodríguez. Asumió el cargo en julio de 2023"
+        )
+
         full_prompt = sys_prompt + "\n\n--- HISTORIAL DE CONVERSACIÓN ---\n"
         
-        # Iterar sobre el historial para concatenar el texto (máx. 5 mensajes)
-        # Se invierte el historial para dar más peso al final de la conversación
         history_text = ""
-        # Usamos los últimos 5 mensajes para mantener el contexto
-        for msg in st.session_state["history"][-5:]: 
+        for msg in st.session_state["history"][-5:]:
             role = "Asistente" if msg["role"] == "assistant" else "Usuario"
             content = msg["content"]
-            
-            # Omitir el saludo inyectado en el historial para no confundir al modelo
             if not st.session_state["greeted"] and content.startswith(f"¡Hola {first_name}!") and msg["role"] == "assistant":
                 continue 
-            
             history_text += f"{role}: {content}\n"
         
         full_prompt += history_text
-        full_prompt += f"\n--- FIN DEL HISTORIAL ---\n\nÚltimo mensaje del Usuario: {user_msg}"
+        full_prompt += "\n--- FIN DEL HISTORIAL ---\n\n"
+
+        # ================== NUEVO: contexto RAG ==================
+        rag_context = rag_retrieve_context(user_msg)
+        if rag_context:
+            full_prompt += (
+                "A continuación tienes información de referencia obtenida de documentos internos en PDF de la UMSNH. "
+                "Úsala solo si es relevante para responder, y si no aplica, ignórala.\n"
+                "\n--- CONTEXTO DE DOCUMENTOS ---\n"
+                f"{rag_context}\n"
+                "--- FIN DEL CONTEXTO DE DOCUMENTOS ---\n\n"
+            )
+        # =========================================================
+
+        full_prompt += f"Último mensaje del Usuario: {user_msg}"
         
-        # 6. Llamar a la función gemini_generate con el prompt de texto único
         reply_raw = gemini_generate(
             full_prompt,
             st.session_state["temperature"],
@@ -514,7 +629,6 @@ with conv_col:
             st.session_state["max_tokens"],
         )
         
-        # 7. Saludo Único (Solo la primera vez)
         if not st.session_state["greeted"]:
             saludo = f"¡Hola {first_name}! Soy NICO, tu asistente virtual.\n\n"
             reply = saludo + reply_raw
@@ -522,14 +636,12 @@ with conv_col:
         else:
             reply = reply_raw
 
-        # 8. Guardar respuesta del asistente
         st.session_state["history"].append({"role": "assistant", "content": reply})
         
-        # Bajamos la bandera pero NO borramos el input
         st.session_state["trigger_run"] = False
         st.rerun()
 
-    # Mostrar historial
+    # Mostrar historial (tal como lo tienes: última respuesta del asistente)
     for msg in reversed(st.session_state["history"][-20:]):
         if msg["role"] == "user":
             st.chat_message("user").markdown(msg["content"])
