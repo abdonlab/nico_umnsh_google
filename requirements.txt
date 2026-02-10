@@ -3,3 +3,6 @@ python-dotenv
 google-auth==2.33.0
 google-auth-oauthlib==1.2.1
 requests
+pypdf
+faiss-cpu
+sentence-transformers
