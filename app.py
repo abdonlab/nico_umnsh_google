@@ -196,7 +196,7 @@ SCOPES = [
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 GEMINI_MODEL = st.secrets.get(
-    "GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite-preview-02-05")
+    "GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite-preview-02-05")
 )
 
 # ============================================================
